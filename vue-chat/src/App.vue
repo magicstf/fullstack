@@ -108,9 +108,16 @@
 
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { streamChat } from './api'
+import {
+  streamChat,
+  fetchSessions,
+  createSession as apiCreateSession,
+  fetchMessages,
+  addMessage,
+  clearMessages
+} from './api'
 
-const STORAGE_KEY = 'fullstack-chat-sessions'
+const ACTIVE_SESSION_KEY = 'fullstack-chat-active-session'
 const THEME_KEY = 'fullstack-chat-theme'
 const SYSTEM_PROMPT = { role: 'system', content: '你是简洁友好的AI助手' }
 const MAX_INPUT_LENGTH = 2000
@@ -138,14 +145,25 @@ const inputLength = computed(() => inputText.value.length)
 const isNearLimit = computed(() => inputLength.value >= MAX_INPUT_LENGTH * 0.9)
 const isAtLimit = computed(() => inputLength.value >= MAX_INPUT_LENGTH)
 
-function generateId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-}
-
 function formatTime(ts) {
   const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
   const pad = (n) => String(n).padStart(2, '0')
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function mapApiMessages(list) {
+  return list
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .map((m) => ({ role: m.role, content: m.content }))
+}
+
+async function loadSessionMessages(sessionId) {
+  const list = await fetchMessages(sessionId)
+  const session = sessions.value.find((s) => s.id === sessionId)
+  if (session) {
+    session.messages = mapApiMessages(list)
+  }
 }
 
 function normalizePastedText(text) {
@@ -212,63 +230,52 @@ function loadTheme() {
   applyTheme(prefersDark ? 'dark' : 'light')
 }
 
-function persist() {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      sessions: sessions.value,
-      activeSessionId: activeSessionId.value
-    })
-  )
+function persistActiveSession() {
+  localStorage.setItem(ACTIVE_SESSION_KEY, activeSessionId.value)
 }
 
-function loadFromStorage() {
+async function initSessions() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    const data = JSON.parse(raw)
-    if (!Array.isArray(data.sessions) || data.sessions.length === 0) return null
-    for (const session of data.sessions) {
-      session.messages = session.messages.filter(
-        (m) => m.status !== 'loading' && m.status !== 'streaming'
-      )
-      for (const m of session.messages) {
-        delete m.status
-      }
+    const list = await fetchSessions()
+    if (list.length === 0) {
+      await createSession()
+      return
     }
-    return data
-  } catch {
-    return null
+    sessions.value = list.map((s) => ({ ...s, messages: [] }))
+    const savedId = localStorage.getItem(ACTIVE_SESSION_KEY)
+    const targetId = sessions.value.find((s) => s.id === savedId)?.id || sessions.value[0].id
+    activeSessionId.value = targetId
+    await loadSessionMessages(targetId)
+  } catch (err) {
+    console.error('加载会话失败：', err)
+    await createSession()
   }
 }
 
-function createSession() {
-  const session = {
-    id: generateId(),
-    title: '新对话',
-    messages: [],
-    updatedAt: Date.now()
-  }
+async function createSession() {
+  const data = await apiCreateSession()
+  const session = { ...data, messages: [] }
   sessions.value.unshift(session)
   activeSessionId.value = session.id
-  persist()
+  persistActiveSession()
 }
 
-function switchSession(id) {
+async function switchSession(id) {
   if (loading.value || id === activeSessionId.value) return
   activeSessionId.value = id
-  persist()
+  persistActiveSession()
+  await loadSessionMessages(id)
   scrollToBottom()
 }
 
-function clearCurrentSession() {
+async function clearCurrentSession() {
   const session = currentSession.value
   if (!session || session.messages.length === 0) return
   if (!confirm('确定清空当前会话的所有聊天记录？')) return
+  await clearMessages(session.id)
   session.messages = []
   session.title = '新对话'
-  session.updatedAt = Date.now()
-  persist()
+  session.updatedAt = new Date().toISOString()
 }
 
 function updateSessionTitle(session, userText) {
@@ -298,7 +305,7 @@ function resolveErrorMessage(err) {
   return err?.message || '请求出错，请稍后重试'
 }
 
-function finalizeAssistantMessage(session, aiIndex, status) {
+async function finalizeAssistantMessage(session, aiIndex, status) {
   const msg = session.messages[aiIndex]
   if (!msg) return
 
@@ -315,8 +322,13 @@ function finalizeAssistantMessage(session, aiIndex, status) {
     delete msg.status
   }
 
-  session.updatedAt = Date.now()
-  persist()
+  session.updatedAt = new Date().toISOString()
+
+  try {
+    await addMessage(session.id, 'assistant', msg.content)
+  } catch (err) {
+    console.error('保存 AI 消息失败：', err)
+  }
 }
 
 function stopGeneration() {
@@ -336,18 +348,9 @@ function handleOffline() {
 
 watch(displayMessages, scrollToBottom, { deep: true })
 
-onMounted(() => {
+onMounted(async () => {
   loadTheme()
-  const saved = loadFromStorage()
-  if (saved) {
-    sessions.value = saved.sessions
-    activeSessionId.value = saved.activeSessionId
-    if (!sessions.value.find((s) => s.id === activeSessionId.value)) {
-      activeSessionId.value = sessions.value[0].id
-    }
-  } else {
-    createSession()
-  }
+  await initSessions()
   window.addEventListener('online', handleOnline)
   window.addEventListener('offline', handleOffline)
   scrollToBottom()
@@ -369,9 +372,17 @@ const handleSend = async () => {
   inputText.value = ''
 
   updateSessionTitle(session, text)
+
+  try {
+    await addMessage(session.id, 'user', text)
+  } catch (err) {
+    console.error('保存用户消息失败：', err)
+    loading.value = false
+    return
+  }
+
   session.messages.push({ role: 'user', content: text })
-  session.updatedAt = Date.now()
-  persist()
+  session.updatedAt = new Date().toISOString()
   scrollToBottom()
 
   const apiMessages = [
@@ -393,29 +404,33 @@ const handleSend = async () => {
         if (msg.status === 'loading') msg.status = 'streaming'
         msg.content += text
         scrollToBottom()
-      },
-      onDone: () => {
-        finalizeAssistantMessage(session, aiIndex, 'done')
       }
     })
 
-    if (receivedDone) return
+    if (receivedDone) {
+      await finalizeAssistantMessage(session, aiIndex, 'done')
+      return
+    }
 
     if (!userAborted) {
       const msg = session.messages[aiIndex]
       if (!msg.content) throw new Error('模型未返回有效内容')
     }
 
-    finalizeAssistantMessage(session, aiIndex, userAborted ? 'stopped' : 'done')
+    await finalizeAssistantMessage(session, aiIndex, userAborted ? 'stopped' : 'done')
   } catch (err) {
     if (userAborted) {
-      finalizeAssistantMessage(session, aiIndex, 'stopped')
+      await finalizeAssistantMessage(session, aiIndex, 'stopped')
     } else {
       const msg = session.messages[aiIndex]
       msg.content = resolveErrorMessage(err)
       msg.status = 'error'
-      session.updatedAt = Date.now()
-      persist()
+      session.updatedAt = new Date().toISOString()
+      try {
+        await addMessage(session.id, 'assistant', msg.content)
+      } catch (saveErr) {
+        console.error('保存错误消息失败：', saveErr)
+      }
       console.error('请求异常：', err)
     }
   } finally {
