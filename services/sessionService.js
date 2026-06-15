@@ -13,7 +13,8 @@ function mapSession(row) {
     id: row.id,
     createdAt: row.created_at,
     updatedAt: row.updated_at || row.created_at,
-    title
+    title,
+    messageCount: Number(row.message_count) || 0
   }
 }
 
@@ -26,7 +27,8 @@ export async function listSessions() {
        (SELECT m.content FROM message m
         WHERE m.session_id = s.id AND m.role = 'user'
         ORDER BY m.created_at ASC LIMIT 1) AS first_user_content,
-       (SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id) AS updated_at
+       (SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id) AS updated_at,
+       (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS message_count
      FROM session s
      ORDER BY COALESCE(updated_at, s.created_at) DESC`
   )
@@ -45,7 +47,8 @@ export async function createSession(id = crypto.randomUUID()) {
     id: row.id,
     createdAt: row.created_at,
     updatedAt: row.created_at,
-    title: '新对话'
+    title: '新对话',
+    messageCount: 0
   }
 }
 
@@ -58,7 +61,8 @@ export async function getSession(sessionId) {
        (SELECT m.content FROM message m
         WHERE m.session_id = s.id AND m.role = 'user'
         ORDER BY m.created_at ASC LIMIT 1) AS first_user_content,
-       (SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id) AS updated_at
+       (SELECT MAX(m.created_at) FROM message m WHERE m.session_id = s.id) AS updated_at,
+       (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) AS message_count
      FROM session s
      WHERE s.id = ?`,
     [sessionId]

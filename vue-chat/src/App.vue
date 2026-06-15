@@ -9,15 +9,39 @@
           <button class="btn-new" @click="createSession" :disabled="loading">新建</button>
         </div>
         <ul class="session-list">
-          <li
-            v-for="session in sessions"
-            :key="session.id"
-            :class="['session-item', { active: session.id === activeSessionId }]"
-            @click="switchSession(session.id)"
-          >
-            <span class="session-name">{{ session.title }}</span>
-            <span class="session-time">{{ formatTime(session.updatedAt) }}</span>
-          </li>
+          <li v-if="sessionsLoading" class="session-hint">加载历史会话...</li>
+          <li v-else-if="sessions.length === 0" class="session-hint">暂无会话，点击新建</li>
+          <template v-else>
+            <li
+              v-for="session in sessions"
+              :key="session.id"
+              :class="['session-swipe-item', { 'is-open': isSessionSwipedOpen(session.id) }]"
+            >
+              <button
+                class="session-delete-btn"
+                type="button"
+                aria-label="删除会话"
+                @click.stop="removeSession(session.id)"
+              >
+                删除
+              </button>
+              <div
+                :class="['session-item', { active: session.id === activeSessionId }]"
+                :style="getSwipeStyle(session.id)"
+                @click="handleSessionClick(session.id)"
+                @touchstart.passive="onSwipeStart($event, session.id)"
+                @touchmove="onSwipeMove($event, session.id)"
+                @touchend="onSwipeEnd(session.id)"
+                @mousedown="onSwipeStart($event, session.id)"
+              >
+                <span class="session-name">{{ session.title }}</span>
+                <span class="session-meta">
+                  <span class="session-time">{{ formatTime(session.updatedAt) }}</span>
+                  <span v-if="session.messageCount" class="session-count">{{ session.messageCount }}条</span>
+                </span>
+              </div>
+            </li>
+          </template>
         </ul>
       </aside>
 
@@ -39,35 +63,41 @@
         </div>
 
         <div ref="chatBox" class="chat-box">
-          <div
-            v-for="(msg, index) in displayMessages"
-            :key="index"
-            :class="['message-row', msg.role]"
-          >
-            <div class="avatar" :class="msg.role" aria-hidden="true">
-              <span v-if="msg.role === 'user'">我</span>
-              <span v-else>AI</span>
-            </div>
-
-            <div :class="['bubble', msg.role, msg.status]">
-              <div
-                v-if="msg.role === 'assistant' && msg.status === 'loading'"
-                class="skeleton"
-                aria-label="AI 正在思考"
-              >
-                <span class="skeleton-line w-full"></span>
-                <span class="skeleton-line w-80"></span>
-                <span class="skeleton-line w-60"></span>
-              </div>
-              <div v-else class="bubble-content">
-                <span class="content">{{ msg.content }}</span>
-                <span
-                  v-if="msg.role === 'assistant' && msg.status === 'streaming'"
-                  class="typing-cursor"
-                >|</span>
-              </div>
-            </div>
+          <div v-if="messagesLoading" class="chat-loading">正在加载历史消息...</div>
+          <div v-else-if="displayMessages.length === 0" class="chat-empty">
+            暂无消息，开始你的第一句对话吧
           </div>
+          <template v-else>
+            <div
+              v-for="(msg, index) in displayMessages"
+              :key="index"
+              :class="['message-row', msg.role]"
+            >
+              <div class="avatar" :class="msg.role" aria-hidden="true">
+                <span v-if="msg.role === 'user'">我</span>
+                <span v-else>AI</span>
+              </div>
+
+              <div :class="['bubble', msg.role, msg.status]">
+                <div
+                  v-if="msg.role === 'assistant' && msg.status === 'loading'"
+                  class="skeleton"
+                  aria-label="AI 正在思考"
+                >
+                  <span class="skeleton-line w-full"></span>
+                  <span class="skeleton-line w-80"></span>
+                  <span class="skeleton-line w-60"></span>
+                </div>
+                <div v-else class="bubble-content">
+                  <span class="content">{{ msg.content }}</span>
+                  <span
+                    v-if="msg.role === 'assistant' && msg.status === 'streaming'"
+                    class="typing-cursor"
+                  >|</span>
+                </div>
+              </div>
+            </div>
+          </template>
         </div>
 
         <div class="input-area">
@@ -111,16 +141,18 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import {
   streamChat,
   fetchSessions,
+  fetchSessionDetail,
   createSession as apiCreateSession,
-  fetchMessages,
   addMessage,
-  clearMessages
+  clearMessages,
+  deleteSession
 } from './api'
 
 const ACTIVE_SESSION_KEY = 'fullstack-chat-active-session'
 const THEME_KEY = 'fullstack-chat-theme'
 const SYSTEM_PROMPT = { role: 'system', content: '你是简洁友好的AI助手' }
 const MAX_INPUT_LENGTH = 2000
+const SWIPE_DELETE_WIDTH = 72
 
 const inputText = ref('')
 const inputRef = ref(null)
@@ -130,6 +162,18 @@ const isOnline = ref(navigator.onLine)
 const theme = ref('light')
 const sessions = ref([])
 const activeSessionId = ref('')
+const sessionsLoading = ref(false)
+const messagesLoading = ref(false)
+
+const swipedSessionId = ref(null)
+const swipeOffset = ref(0)
+const isSwipeDragging = ref(false)
+
+let swipeStartX = 0
+let swipeStartOffset = 0
+let swipingSessionId = null
+let swipeMoved = false
+let mouseDragSessionId = null
 
 let abortController = null
 let streamReader = null
@@ -158,11 +202,28 @@ function mapApiMessages(list) {
     .map((m) => ({ role: m.role, content: m.content }))
 }
 
-async function loadSessionMessages(sessionId) {
-  const list = await fetchMessages(sessionId)
-  const session = sessions.value.find((s) => s.id === sessionId)
-  if (session) {
-    session.messages = mapApiMessages(list)
+async function refreshSessionList() {
+  const list = await fetchSessions()
+  const cachedMessages = new Map(sessions.value.map((s) => [s.id, s.messages]))
+  sessions.value = list.map((s) => ({
+    ...s,
+    messages: cachedMessages.get(s.id) ?? []
+  }))
+}
+
+async function loadSessionDetail(sessionId) {
+  messagesLoading.value = true
+  try {
+    const detail = await fetchSessionDetail(sessionId)
+    const session = sessions.value.find((s) => s.id === sessionId)
+    if (session) {
+      session.title = detail.title
+      session.updatedAt = detail.updatedAt
+      session.messageCount = detail.messageCount
+      session.messages = mapApiMessages(detail.messages)
+    }
+  } finally {
+    messagesLoading.value = false
   }
 }
 
@@ -235,6 +296,7 @@ function persistActiveSession() {
 }
 
 async function initSessions() {
+  sessionsLoading.value = true
   try {
     const list = await fetchSessions()
     if (list.length === 0) {
@@ -245,10 +307,12 @@ async function initSessions() {
     const savedId = localStorage.getItem(ACTIVE_SESSION_KEY)
     const targetId = sessions.value.find((s) => s.id === savedId)?.id || sessions.value[0].id
     activeSessionId.value = targetId
-    await loadSessionMessages(targetId)
+    await loadSessionDetail(targetId)
   } catch (err) {
     console.error('加载会话失败：', err)
     await createSession()
+  } finally {
+    sessionsLoading.value = false
   }
 }
 
@@ -261,11 +325,142 @@ async function createSession() {
 }
 
 async function switchSession(id) {
-  if (loading.value || id === activeSessionId.value) return
+  if (loading.value || id === activeSessionId.value || messagesLoading.value) return
+  resetSwipe()
   activeSessionId.value = id
   persistActiveSession()
-  await loadSessionMessages(id)
+  await loadSessionDetail(id)
   scrollToBottom()
+}
+
+function resetSwipe() {
+  swipedSessionId.value = null
+  swipeOffset.value = 0
+  isSwipeDragging.value = false
+  swipingSessionId = null
+  swipeMoved = false
+}
+
+function getSwipeStyle(sessionId) {
+  const offset =
+    swipedSessionId.value === sessionId || swipingSessionId === sessionId
+      ? swipeOffset.value
+      : 0
+  return {
+    transform: `translateX(${offset}px)`,
+    transition: isSwipeDragging.value ? 'none' : 'transform 0.2s ease'
+  }
+}
+
+function isSessionSwipedOpen(sessionId) {
+  return swipedSessionId.value === sessionId && swipeOffset.value < 0
+}
+
+function getSwipeClientX(e) {
+  return e.touches?.[0]?.clientX ?? e.clientX
+}
+
+function onSwipeStart(e, sessionId) {
+  if (loading.value) return
+  if (e.type === 'mousedown' && e.button !== 0) return
+
+  if (swipedSessionId.value && swipedSessionId.value !== sessionId) {
+    resetSwipe()
+  }
+
+  swipeStartX = getSwipeClientX(e)
+  swipingSessionId = sessionId
+  swipeMoved = false
+  isSwipeDragging.value = true
+  swipeStartOffset =
+    swipedSessionId.value === sessionId ? swipeOffset.value : 0
+  swipedSessionId.value = sessionId
+
+  if (e.type === 'mousedown') {
+    mouseDragSessionId = sessionId
+    document.addEventListener('mousemove', onDocumentSwipeMove)
+    document.addEventListener('mouseup', onDocumentSwipeEnd)
+  }
+}
+
+function onSwipeMove(e, sessionId) {
+  if (swipingSessionId !== sessionId) return
+
+  const delta = getSwipeClientX(e) - swipeStartX
+  if (Math.abs(delta) > 8) {
+    swipeMoved = true
+    if (e.cancelable) e.preventDefault()
+  }
+
+  swipeOffset.value = Math.min(0, Math.max(-SWIPE_DELETE_WIDTH, swipeStartOffset + delta))
+}
+
+function onSwipeEnd(sessionId) {
+  if (swipingSessionId !== sessionId) return
+
+  isSwipeDragging.value = false
+  swipingSessionId = null
+
+  if (swipeOffset.value < -SWIPE_DELETE_WIDTH / 2) {
+    swipeOffset.value = -SWIPE_DELETE_WIDTH
+    swipedSessionId.value = sessionId
+  } else {
+    resetSwipe()
+  }
+}
+
+function onDocumentSwipeMove(e) {
+  if (mouseDragSessionId) onSwipeMove(e, mouseDragSessionId)
+}
+
+function onDocumentSwipeEnd(e) {
+  if (!mouseDragSessionId) return
+  const sessionId = mouseDragSessionId
+  mouseDragSessionId = null
+  document.removeEventListener('mousemove', onDocumentSwipeMove)
+  document.removeEventListener('mouseup', onDocumentSwipeEnd)
+  onSwipeEnd(sessionId)
+}
+
+function handleSessionClick(sessionId) {
+  if (swipeMoved) {
+    swipeMoved = false
+    return
+  }
+  if (swipedSessionId.value === sessionId && swipeOffset.value < 0) {
+    resetSwipe()
+    return
+  }
+  switchSession(sessionId)
+}
+
+async function removeSession(sessionId) {
+  if (loading.value) return
+
+  const session = sessions.value.find((s) => s.id === sessionId)
+  if (!session) return
+
+  if (!confirm(`确定删除会话「${session.title}」？`)) {
+    resetSwipe()
+    return
+  }
+
+  try {
+    await deleteSession(sessionId)
+    sessions.value = sessions.value.filter((s) => s.id !== sessionId)
+    resetSwipe()
+
+    if (activeSessionId.value === sessionId) {
+      if (sessions.value.length > 0) {
+        await switchSession(sessions.value[0].id)
+      } else {
+        await createSession()
+      }
+    }
+  } catch (err) {
+    console.error('删除会话失败：', err)
+    resetSwipe()
+  }
 }
 
 async function clearCurrentSession() {
@@ -275,7 +470,9 @@ async function clearCurrentSession() {
   await clearMessages(session.id)
   session.messages = []
   session.title = '新对话'
+  session.messageCount = 0
   session.updatedAt = new Date().toISOString()
+  await refreshSessionList()
 }
 
 function updateSessionTitle(session, userText) {
@@ -326,6 +523,7 @@ async function finalizeAssistantMessage(session, aiIndex, status) {
 
   try {
     await addMessage(session.id, 'assistant', msg.content)
+    await refreshSessionList()
   } catch (err) {
     console.error('保存 AI 消息失败：', err)
   }
@@ -359,6 +557,8 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener('online', handleOnline)
   window.removeEventListener('offline', handleOffline)
+  document.removeEventListener('mousemove', onDocumentSwipeMove)
+  document.removeEventListener('mouseup', onDocumentSwipeEnd)
   stopGeneration()
 })
 
@@ -382,7 +582,9 @@ const handleSend = async () => {
   }
 
   session.messages.push({ role: 'user', content: text })
+  session.messageCount = (session.messageCount || 0) + 1
   session.updatedAt = new Date().toISOString()
+  await refreshSessionList()
   scrollToBottom()
 
   const apiMessages = [
@@ -562,22 +764,60 @@ const handleSend = async () => {
   margin: 0;
   padding: 6px;
   overflow-y: auto;
+  overflow-x: hidden;
   flex: 1;
 }
 
+.session-swipe-item {
+  position: relative;
+  margin-bottom: 4px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.session-delete-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 72px;
+  border: none;
+  background: #f56c6c;
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  z-index: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.session-swipe-item.is-open .session-delete-btn {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.session-delete-btn:hover {
+  background: #e53935;
+}
+
 .session-item {
+  position: relative;
+  z-index: 1;
   padding: 8px 10px;
   border-radius: 8px;
   cursor: pointer;
-  margin-bottom: 4px;
+  background: var(--bg-panel);
+  touch-action: pan-y;
+  user-select: none;
 }
 
 .session-item:hover {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-panel));
 }
 
 .session-item.active {
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-panel));
 }
 
 .session-name {
@@ -590,10 +830,41 @@ const handleSend = async () => {
 }
 
 .session-time {
-  display: block;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.session-hint {
+  padding: 16px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  cursor: default;
+}
+
+.session-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   margin-top: 2px;
+}
+
+.session-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.chat-loading,
+.chat-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: 200px;
+  font-size: 14px;
+  color: var(--text-secondary);
 }
 
 .chat-container {

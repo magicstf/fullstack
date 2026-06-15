@@ -23,6 +23,16 @@ router.post(
   })
 )
 
+/** GET /api/sessions/:sessionId/detail - 会话详情（含历史消息） */
+router.get(
+  '/sessions/:sessionId/detail',
+  asyncHandler(async (req, res) => {
+    const session = await sessionService.getSession(req.params.sessionId)
+    const messages = await messageService.listMessages(req.params.sessionId)
+    res.json({ ...session, messages })
+  })
+)
+
 /** GET /api/sessions/:sessionId - 会话详情 */
 router.get(
   '/sessions/:sessionId',

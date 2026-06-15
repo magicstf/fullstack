@@ -3,6 +3,7 @@ export { request, ApiError } from './request.js'
 export { streamChat } from './chat.js'
 export {
   fetchSessions,
+  fetchSessionDetail,
   createSession,
   fetchMessages,
   addMessage,
